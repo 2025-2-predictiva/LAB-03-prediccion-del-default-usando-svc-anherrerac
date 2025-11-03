@@ -1,323 +1,154 @@
-# flake8: noqa: E501
-"""
-Credit Card Default Prediction Model
-Clasificación de default de pagos usando SVM con pipeline optimizado
-"""
-
-import gzip
-import json
 import os
-import pickle
-import warnings
-
-import numpy as np
 import pandas as pd
-from sklearn.compose import ColumnTransformer
-from sklearn.decomposition import PCA
-from sklearn.feature_selection import SelectKBest, f_classif
-from sklearn.metrics import (
-    balanced_accuracy_score,
-    confusion_matrix,
-    f1_score,
-    precision_score,
-    recall_score,
-)
-from sklearn.model_selection import GridSearchCV, StratifiedKFold
+import json
+from sklearn.metrics import confusion_matrix, balanced_accuracy_score, f1_score, precision_score, recall_score
 from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.preprocessing import OneHotEncoder
+from sklearn.decomposition import PCA
+from sklearn.feature_selection import SelectKBest
+from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import StandardScaler
 from sklearn.svm import SVC
+from sklearn.model_selection import GridSearchCV
 
-warnings.filterwarnings("ignore")
+# Paso 1.
 
+def load_and_clean(path):
+    df = pd.read_csv(path, compression="zip")
+    df = df.rename(columns = {'default payment next month':'default'})
+    df = df.drop('ID', axis=1)
+    df = df.loc[df["MARRIAGE"] != 0] 
+    df = df.loc[df["EDUCATION"] != 0] 
+    df = df.dropna()
+    df['EDUCATION'] = df['EDUCATION'].map(lambda x: 4 if x>4 else x)
 
-def load_and_clean_data():
-    """
-    Paso 1: Cargar y limpiar los datasets
-    """
-    # Cargar datos
-    train_data = pd.read_csv(
-        "files/input/train_data.csv.zip",
-        compression="zip",
-        index_col=False,
-    )
-    test_data = pd.read_csv(
-        "files/input/test_data.csv.zip",  # CORREGIDO: quitado el .csv duplicado
-        compression="zip",
-        index_col=False,
-    )
+    return df
 
-    # Renombrar columna objetivo
-    train_data = train_data.rename(
-        columns={"default payment next month": "default"}
-    )
-    test_data = test_data.rename(
-        columns={"default payment next month": "default"}
-    )
+df_train = load_and_clean('files/input/train_data.csv.zip')
+df_test = load_and_clean('files/input/test_data.csv.zip')
 
-    # Remover columna ID
-    if "ID" in train_data.columns:
-        train_data = train_data.drop(columns=["ID"])
-    if "ID" in test_data.columns:
-        test_data = test_data.drop(columns=["ID"])
+# Paso 2.
 
-    # Eliminar registros con información no disponible
-    # EDUCATION: 0 es N/A
-    # MARRIAGE: 0 es N/A
-    train_data = train_data[
-        (train_data["EDUCATION"] != 0) & (train_data["MARRIAGE"] != 0)
-    ]
-    test_data = test_data[
-        (test_data["EDUCATION"] != 0) & (test_data["MARRIAGE"] != 0)
-    ]
+x_train = df_train.drop(columns='default')
+y_train = df_train['default']
 
-    # Agrupar EDUCATION > 4 en categoría "others" (4)
-    train_data.loc[train_data["EDUCATION"] > 4, "EDUCATION"] = 4
-    test_data.loc[test_data["EDUCATION"] > 4, "EDUCATION"] = 4
+x_test = df_test.drop(columns='default')
+y_test = df_test['default']
 
-    return train_data, test_data
+#
+# Paso 3.
 
 
-def split_features_target(train_data, test_data):
-    """
-    Paso 2: Dividir datasets en X e y
-    """
-    x_train = train_data.drop(columns=["default"])
-    y_train = train_data["default"]
+def make_pipeline():
 
-    x_test = test_data.drop(columns=["default"])
-    y_test = test_data["default"]
+    categoric_columns = ['SEX','EDUCATION','MARRIAGE']
 
-    return x_train, y_train, x_test, y_test
+    other_columns = [col for col in x_train.columns if col not in categoric_columns]
+
+    preprocessor = ColumnTransformer(transformers=[
+        ('onehot', OneHotEncoder(handle_unknown='ignore'), categoric_columns),
+        ("scaler", StandardScaler(with_mean=True, with_std=True), other_columns)
+        ],remainder='passthrough')
 
 
-def create_pipeline():
-    """
-    Paso 3: Crear pipeline de clasificación
-    """
-    # Identificar columnas categóricas
-    categorical_features = ["SEX", "EDUCATION", "MARRIAGE"]
-
-    # Crear transformador para one-hot encoding
-    preprocessor = ColumnTransformer(
-        transformers=[
-            (
-                "cat",
-                OneHotEncoder(drop="first", sparse_output=False),
-                categorical_features,
-            )
-        ],
-        remainder="passthrough",
-    )
-
-    # Crear pipeline optimizado
     pipeline = Pipeline(
-        [
-            ("onehotencoder", preprocessor),
-            ("scaler", StandardScaler()),
-            ("pca", PCA()),
-            ("selectkbest", SelectKBest(score_func=f_classif)),
-            ("svc", SVC(random_state=42, class_weight="balanced")),
+        steps=[
+            ("preprocessor", preprocessor),
+            ('pca', PCA()),
+            ('selectkbest', SelectKBest()),
+            ('svm', SVC(kernel="rbf", random_state=12345, max_iter=-1) )
         ]
     )
 
     return pipeline
 
+pipeline = make_pipeline()
 
-def optimize_hyperparameters(pipeline, x_train, y_train):
-    """
-    Paso 4: Optimizar hiperparámetros usando GridSearchCV
-    """
-    # Definir grilla de hiperparámetros más amplia y optimizada
-    param_grid = {
-        "pca__n_components": [0.85, 0.90, 0.95, None],
-        "selectkbest__k": [10, 15, 20, 25, "all"],
-        "svc__C": [0.1, 1, 10, 100],
-        "svc__kernel": ["rbf", "linear"],
-        "svc__gamma": ["scale", "auto", 0.1, 0.01],
-    }
+#
+# Paso 4.
+#
+def make_grid_search(estimator):
 
-    # Usar StratifiedKFold para mejor manejo de clases desbalanceadas
-    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
-
-    # Crear GridSearchCV optimizado
     grid_search = GridSearchCV(
-        estimator=pipeline,
-        param_grid=param_grid,
-        cv=cv,
-        scoring="f1",  # Cambiar a f1 para mejor balance entre precision y recall
+        estimator=estimator,
+        param_grid = {
+            "pca__n_components": [20, x_train.shape[1] - 2],  
+            'selectkbest__k': [12],           
+            'svm__kernel': ["rbf"],           
+            'svm__gamma': [0.1],                  
+        },
+        cv=10,
+        scoring='balanced_accuracy',
         n_jobs=-1,
-        verbose=1,
-        return_train_score=True,
+        verbose=3
     )
-
-    # Ajustar modelo
-    print("Entrenando modelo con validación cruzada...")
-    grid_search.fit(x_train, y_train)
-
-    print(f"Mejores parámetros: {grid_search.best_params_}")
-    print(f"Mejor score (f1): {grid_search.best_score_:.4f}")
 
     return grid_search
 
-
-def save_model(model, filename):
-    """
-    Paso 5: Guardar modelo comprimido
-    """
-    os.makedirs(os.path.dirname(filename), exist_ok=True)
-
-    with gzip.open(filename, "wb") as file:
-        pickle.dump(model, file)
-
-    print(f"Modelo guardado en: {filename}")
+estimator = make_grid_search(pipeline)
+estimator.fit(x_train, y_train)
+#
+# Paso 5.
 
 
-def calculate_metrics(model, x_train, y_train, x_test, y_test):
-    """
-    Paso 6: Calcular métricas de clasificación
-    """
-    # Predicciones
-    y_train_pred = model.predict(x_train)
-    y_test_pred = model.predict(x_test)
+def save_estimator(estimator, path):
 
-    # Métricas para conjunto de entrenamiento
-    train_metrics = {
+    import pickle
+    import gzip
+    import os
+
+    os.makedirs(os.path.dirname(path), exist_ok=True) 
+    with gzip.open(path, "wb") as f:
+        pickle.dump(estimator, f)
+
+save_estimator(estimator,'files/models/model.pkl.gz')
+
+#
+# Paso 6.
+
+def check_estimator(estimator, x, y, dataset):
+
+    y_pred = estimator.predict(x)
+
+    precision = round(precision_score(y, y_pred), 4)
+    balanced_accuracy = round(balanced_accuracy_score(y, y_pred), 4)
+    f1 = round(f1_score(y, y_pred), 4)
+    recall = round(recall_score(y, y_pred), 4)
+
+    metrics = {
         "type": "metrics",
-        "dataset": "train",
-        "precision": float(precision_score(y_train, y_train_pred, zero_division=0)),
-        "balanced_accuracy": float(
-            balanced_accuracy_score(y_train, y_train_pred)
-        ),
-        "recall": float(recall_score(y_train, y_train_pred, zero_division=0)),
-        "f1_score": float(f1_score(y_train, y_train_pred, zero_division=0)),
+        "dataset": dataset,
+        "precision": precision,
+        "balanced_accuracy": balanced_accuracy,
+        "recall": recall,
+        "f1_score": f1
+    }
+    
+    return metrics, y_pred, y
+
+
+
+metrics_train, y_pred_train, y_train = check_estimator(estimator, x_train, y_train, "train")
+metrics_test, y_pred_test, y_test = check_estimator(estimator, x_test, y_test, "test")
+
+#
+# Paso 7.
+
+def c_matrix(y_true, y_pred, dataset):
+    cm = confusion_matrix(y_true, y_pred)
+    return {
+        "type": "cm_matrix", "dataset": dataset,
+        "true_0": {"predicted_0": int(cm[0, 0]), "predicted_1": int(cm[0, 1])},
+        "true_1": {"predicted_0": int(cm[1, 0]), "predicted_1": int(cm[1, 1])}
     }
 
-    # Métricas para conjunto de prueba
-    test_metrics = {
-        "type": "metrics",
-        "dataset": "test",
-        "precision": float(precision_score(y_test, y_test_pred, zero_division=0)),
-        "balanced_accuracy": float(balanced_accuracy_score(y_test, y_test_pred)),
-        "recall": float(recall_score(y_test, y_test_pred, zero_division=0)),
-        "f1_score": float(f1_score(y_test, y_test_pred, zero_division=0)),
-    }
+os.makedirs("files/output", exist_ok=True)
 
-    return train_metrics, test_metrics, y_train_pred, y_test_pred
+c_train = c_matrix(y_train, y_pred_train, "train")
+c_test = c_matrix(y_test, y_pred_test, "test")
 
-
-def calculate_confusion_matrices(y_train, y_train_pred, y_test, y_test_pred):
-    """
-    Paso 7: Calcular matrices de confusión
-    """
-    # Matriz de confusión para entrenamiento
-    cm_train = confusion_matrix(y_train, y_train_pred)
-    train_cm = {
-        "type": "cm_matrix",
-        "dataset": "train",
-        "true_0": {
-            "predicted_0": int(cm_train[0, 0]),
-            "predicted_1": int(cm_train[0, 1]),
-        },
-        "true_1": {
-            "predicted_0": int(cm_train[1, 0]),
-            "predicted_1": int(cm_train[1, 1]),
-        },
-    }
-
-    # Matriz de confusión para prueba
-    cm_test = confusion_matrix(y_test, y_test_pred)
-    test_cm = {
-        "type": "cm_matrix",
-        "dataset": "test",
-        "true_0": {
-            "predicted_0": int(cm_test[0, 0]),
-            "predicted_1": int(cm_test[0, 1]),
-        },
-        "true_1": {
-            "predicted_0": int(cm_test[1, 0]),
-            "predicted_1": int(cm_test[1, 1]),
-        },
-    }
-
-    return train_cm, test_cm
-
-
-def save_metrics(metrics_list, filename):
-    """
-    Guardar métricas en archivo JSON
-    """
-    os.makedirs(os.path.dirname(filename), exist_ok=True)
-
-    with open(filename, "w", encoding="utf-8") as file:
-        for metrics in metrics_list:
-            file.write(json.dumps(metrics) + "\n")
-
-    print(f"Métricas guardadas en: {filename}")
-
-
-def main():
-    """
-    Función principal que ejecuta todo el flujo
-    """
-    print("=" * 70)
-    print("CREDIT CARD DEFAULT PREDICTION MODEL")
-    print("=" * 70)
-
-    # Paso 1: Cargar y limpiar datos
-    print("\n1. Cargando y limpiando datos...")
-    train_data, test_data = load_and_clean_data()
-    print(f"   Train shape: {train_data.shape}")
-    print(f"   Test shape: {test_data.shape}")
-
-    # Paso 2: Dividir en X e y
-    print("\n2. Dividiendo features y target...")
-    x_train, y_train, x_test, y_test = split_features_target(
-        train_data, test_data
-    )
-
-    # Paso 3: Crear pipeline
-    print("\n3. Creando pipeline...")
-    pipeline = create_pipeline()
-
-    # Paso 4: Optimizar hiperparámetros
-    print("\n4. Optimizando hiperparámetros...")
-    model = optimize_hyperparameters(pipeline, x_train, y_train)
-
-    # Paso 5: Guardar modelo
-    print("\n5. Guardando modelo...")
-    save_model(model, "files/models/model.pkl.gz")
-
-    # Paso 6: Calcular métricas
-    print("\n6. Calculando métricas...")
-    train_metrics, test_metrics, y_train_pred, y_test_pred = calculate_metrics(
-        model, x_train, y_train, x_test, y_test
-    )
-
-    # Paso 7: Calcular matrices de confusión
-    print("\n7. Calculando matrices de confusión...")
-    train_cm, test_cm = calculate_confusion_matrices(
-        y_train, y_train_pred, y_test, y_test_pred
-    )
-
-    # Guardar todas las métricas
-    all_metrics = [train_metrics, test_metrics, train_cm, test_cm]
-    save_metrics(all_metrics, "files/output/metrics.json")
-
-    # Resumen de resultados
-    print("\n" + "=" * 70)
-    print("RESULTADOS")
-    print("=" * 70)
-    print(f"\nTRAIN - Balanced Accuracy: {train_metrics['balanced_accuracy']:.4f}")
-    print(f"        Precision: {train_metrics['precision']:.4f}")
-    print(f"        Recall: {train_metrics['recall']:.4f}")
-    print(f"        F1-Score: {train_metrics['f1_score']:.4f}")
-
-    print(f"\nTEST  - Balanced Accuracy: {test_metrics['balanced_accuracy']:.4f}")
-    print(f"        Precision: {test_metrics['precision']:.4f}")
-    print(f"        Recall: {test_metrics['recall']:.4f}")
-    print(f"        F1-Score: {test_metrics['f1_score']:.4f}")
-    print("\n" + "=" * 70)
-
-
-if __name__ == "__main__":
-    main()
+with open("files/output/metrics.json", "w") as file:
+        file.write(json.dumps(metrics_train) + "\n")
+        file.write(json.dumps(metrics_test) + "\n")
+        file.write(json.dumps(c_train) + "\n")
+        file.write(json.dumps(c_test) + "\n")
